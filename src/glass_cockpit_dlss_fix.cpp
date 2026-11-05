@@ -78,6 +78,8 @@ size_t list_draw_slot();
 size_t list_draw_indexed_slot();
 size_t list_copy_texture_region_slot();
 size_t list_set_pipeline_state_slot();
+size_t list_set_descriptor_heaps_slot();
+size_t list_set_compute_root_signature_slot();
 size_t list_set_graphics_root_signature_slot();
 size_t list_set_graphics_root_table_slot();
 size_t list_set_render_targets_slot();
@@ -140,6 +142,16 @@ namespace {
 // The process is exiting (DLL_PROCESS_DETACH): the hooks pass everything straight through from then on, since the
 // fix's own state is being torn down while other modules may still release Direct3D objects.
 std::atomic<bool> shutting_down{false};
+// The fix's own D3D12 calls (the map draw, its views, the compute passes, captures) go through the same hooked
+// functions: they pass straight through while this is set on the calling thread.
+thread_local int internal_calls = 0;
+bool passthrough() { return internal_calls || duplicate_fix.load(std::memory_order_relaxed) || shutting_down.load(std::memory_order_relaxed); }
+struct Internal {
+    Internal() { ++internal_calls; }
+    ~Internal() { --internal_calls; }
+    Internal(const Internal&) = delete;
+    Internal& operator=(const Internal&) = delete;
+};
 // Experimental fixes (panel section of the same name): detail clamp and angle softening in percent, edge fade and edge
 // stretcher and edge trim in hundredths of a render pixel.
 constexpr int default_detail_clamp = 0, max_edge_fade = 250, max_edge_stretch = 400, max_edge_trim = 400;
@@ -178,6 +190,27 @@ std::atomic<int> smoothing_percent{default_smoothing};
 std::atomic<int> glass_percent{100};
 // Bumped when the overlay is switched on: lists recorded while it was off have stale binding state.
 std::atomic<uint32_t> generation{1};
+std::atomic<uint64_t> present_count{0};
+bool fixture_host = false; // the offline test host (no swapchain: it ticks the frame clock itself)
+bool fixture_uses_settings = false;
+// Flight load / warmup grace period: pauses screen capture and composite injection during heavy resource/pipeline
+// creation bursts (e.g. Fenix A320 V3 WASM & display bootstrap at "Start to Fly") or frame-time stalls (>250 ms).
+constexpr int default_load_warmup_delay_frames = 240, max_load_warmup_delay_frames = 1800;
+std::atomic<int> load_warmup_delay_frames{default_load_warmup_delay_frames};
+constexpr uint32_t churn_spike_threshold = 48;
+std::atomic<uint32_t> resource_churn_count{0};
+std::atomic<uint64_t> warmup_until_present{0}, last_frame_tick{0};
+std::atomic<bool> warmup_active{false};
+void record_resource_churn(uint32_t weight = 1) noexcept {
+    resource_churn_count.fetch_add(weight, std::memory_order_relaxed);
+}
+bool in_warmup() noexcept {
+    if (fixture_host && !fixture_uses_settings) return false;
+    const int delay = load_warmup_delay_frames.load(std::memory_order_relaxed);
+    if (delay <= 0) return false;
+    if (resource_churn_count.load(std::memory_order_relaxed) >= churn_spike_threshold) return true;
+    return present_count.load(std::memory_order_relaxed) < warmup_until_present.load(std::memory_order_relaxed);
+}
 FILE* logfile = nullptr;
 std::filesystem::path log_file_path; // the log this session writes (glass-cockpit-dlss-fix.log, or a fallback name)
 std::mutex log_mutex;
@@ -418,6 +451,7 @@ void worker() {
         std::pair<DisplayPipeline*, unsigned> item;
         { std::unique_lock lock(work_mutex); work_ready.wait(lock, [] { return !work.empty(); }); item = work.front(); work.pop_front(); }
         auto [pipeline, slot] = item;
+        if (!pipeline || !pipeline->device || slot > slot_count) continue;
         D3D12_GRAPHICS_PIPELINE_STATE_DESC clone{};
         const bool colour = slot == slot_count; // the screen capture's colour variant
         const std::pair<const unsigned char*, size_t> shader = colour
@@ -427,18 +461,22 @@ void worker() {
             log("variant_rejected slot=%u", slot); continue;
         }
         ID3D12PipelineState* created = nullptr;
-        auto hr = pipeline->device->CreateGraphicsPipelineState(&clone, IID_PPV_ARGS(&created));
-        if (FAILED(hr) && !colour && pipeline->brightness) {
-            // The pipeline's root signature doesn't give the pixel shader the per-instance data (b2): the plain map
-            // shader instead (one brightness per screen texture, as before).
-            LOG_ONCE("display pipeline without per-mesh brightness (hr=0x%lx): plain screen map used", hr);
-            const auto& plain = map_shader(pipeline->vr, false, slot);
-            if (glass::clone_pipeline(pipeline->desc, {plain.first, plain.second}, clone))
-                hr = pipeline->device->CreateGraphicsPipelineState(&clone, IID_PPV_ARGS(&created));
+        HRESULT hr = E_FAIL;
+        {
+            Internal internal;
+            hr = pipeline->device->CreateGraphicsPipelineState(&clone, IID_PPV_ARGS(&created));
+            if (FAILED(hr) && !colour && pipeline->brightness) {
+                // The pipeline's root signature doesn't give the pixel shader the per-instance data (b2): the plain map
+                // shader instead (one brightness per screen texture, as before).
+                LOG_ONCE("display pipeline without per-mesh brightness (hr=0x%lx): plain screen map used", hr);
+                const auto& plain = map_shader(pipeline->vr, false, slot);
+                if (glass::clone_pipeline(pipeline->desc, {plain.first, plain.second}, clone))
+                    hr = pipeline->device->CreateGraphicsPipelineState(&clone, IID_PPV_ARGS(&created));
+            }
         }
-        if (FAILED(hr)) { log("variant_failed slot=%u hr=0x%lx", slot, hr); continue; }
-        if (colour) pipeline->colour_variant = created;
-        else pipeline->variants[slot] = created;
+        if (FAILED(hr) || !created) { log("variant_failed slot=%u hr=0x%lx", slot, hr); continue; }
+        if (colour) pipeline->colour_variant.store(created, std::memory_order_release);
+        else pipeline->variants[slot].store(created, std::memory_order_release);
     }
 }
 ID3D12PipelineState* colour_variant(DisplayPipeline* pipeline) {
@@ -464,7 +502,9 @@ std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> pipeline_hashes; // 
 
 void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, ID3D12PipelineState* pso,
     const D3D12_VIEW_INSTANCING_DESC& views = {}) noexcept try {
-    if (!desc.PS.pShaderBytecode || !desc.VS.pShaderBytecode) return;
+    if (!device || !pso || !desc.pRootSignature || !desc.PS.pShaderBytecode || !desc.VS.pShaderBytecode ||
+        desc.PS.BytecodeLength < 32 || desc.VS.BytecodeLength < 32) return;
+    record_resource_churn(2);
     const auto ps = shader_hash(desc.PS.pShaderBytecode, desc.PS.BytecodeLength), vs = shader_hash(desc.VS.pShaderBytecode, desc.VS.BytecodeLength);
     {
         std::unique_lock lock(hashes_mutex);
@@ -475,6 +515,9 @@ void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_
     const bool screen_t0 = (ps == display_ps_t0 && vs == display_vs) || (ps == vr_display_ps_t0 && vs == vr_display_vs);
     const bool alike = vs == display_vs && std::find(std::begin(display_ps_alike), std::end(display_ps_alike), ps) != std::end(display_ps_alike);
     if (!vr && !screen_t0 && !alike && (ps != display_ps || vs != display_vs)) return;
+    if (desc.InputLayout.NumElements > 32 || (desc.InputLayout.NumElements > 0 && !desc.InputLayout.pInputElementDescs)) return;
+    for (UINT i = 0; i < desc.InputLayout.NumElements; ++i)
+        if (!desc.InputLayout.pInputElementDescs[i].SemanticName) return;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC probe{};
     const auto& shader = map_shader(vr, screen_t0, 0);
     if (!glass::clone_pipeline(desc, {shader.first, shader.second}, probe)) {
@@ -496,10 +539,18 @@ void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_
     copy->vr = vr;
     copy->screen_t0 = screen_t0;
     copy->brightness = !screen_t0 && (vr ? ps == vr_display_ps : ps == display_ps);
-    std::lock_guard lock(pipelines_mutex);
-    for (size_t i = 0; i < max_pipelines; ++i) if (!pipeline_keys[i].load()) {
-        pipeline_values[i] = copy;
-        pipeline_keys[i].store(reinterpret_cast<uint64_t>(pso), std::memory_order_release);
+    record_resource_churn(24);
+    bool inserted = false;
+    {
+        std::lock_guard lock(pipelines_mutex);
+        for (size_t i = 0; i < max_pipelines; ++i) if (!pipeline_keys[i].load()) {
+            pipeline_values[i] = copy;
+            pipeline_keys[i].store(reinterpret_cast<uint64_t>(pso), std::memory_order_release);
+            inserted = true;
+            break;
+        }
+    }
+    if (inserted) {
         if (stats.display_pipelines++ == 0) log("milestone cockpit display shader found (glass cockpit screens can be recognised)");
         const auto func = desc.DepthStencilState.DepthFunc;
         const int direction = !desc.DepthStencilState.DepthEnable ? 0
@@ -513,6 +564,7 @@ void pipeline_created(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_
         if (alike) log("display shader variant ps=%016llx found (binds like the standard one, e.g. FlightFX C750)", ps);
         return;
     }
+    delete copy;
     log("display_pipeline_overflow");
 } catch (...) { log("pipeline_exception"); }
 
@@ -523,13 +575,13 @@ Graphics original_graphics = nullptr;
 Stream original_stream = nullptr;
 HRESULT STDMETHODCALLTYPE graphics_hook(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc, REFIID iid, void** out) {
     const auto hr = original_graphics(device, desc, iid, out);
-    if (SUCCEEDED(hr) && desc && out && *out && iid == __uuidof(ID3D12PipelineState))
+    if (SUCCEEDED(hr) && !passthrough() && desc && out && *out && iid == __uuidof(ID3D12PipelineState))
         pipeline_created(device, *desc, static_cast<ID3D12PipelineState*>(*out));
     return hr;
 }
 HRESULT STDMETHODCALLTYPE stream_hook(ID3D12Device2* device, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, REFIID iid, void** out) {
     const auto hr = original_stream(device, desc, iid, out);
-    if (SUCCEEDED(hr) && desc && out && *out && iid == __uuidof(ID3D12PipelineState)) {
+    if (SUCCEEDED(hr) && !passthrough() && desc && out && *out && iid == __uuidof(ID3D12PipelineState)) {
         D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics{};
         D3D12_VIEW_INSTANCING_DESC views{};
         unsigned unknown = 0;
@@ -537,8 +589,12 @@ HRESULT STDMETHODCALLTYPE stream_hook(ID3D12Device2* device, const D3D12_PIPELIN
         else if (unknown) {
             static std::mutex types_mutex;
             static std::set<unsigned> types;
-            std::lock_guard lock(types_mutex);
-            if (types.size() < 8 && types.insert(unknown).second) log("pipeline_stream_unknown_subobject type=%u (pipelines with it are not inspected)", unknown);
+            bool should_log = false;
+            {
+                std::lock_guard lock(types_mutex);
+                should_log = types.size() < 8 && types.insert(unknown).second;
+            }
+            if (should_log) log("pipeline_stream_unknown_subobject type=%u (pipelines with it are not inspected)", unknown);
         }
     }
     return hr;
@@ -567,17 +623,16 @@ std::string hex(const Signature& s) {
     for (size_t i = 0; i < 32; ++i) snprintf(text + i * 2, 3, "%02x", s.bytes[i]);
     return text;
 }
-std::array<DXGI_FORMAT, slot_count> slot_formats{};
+std::array<std::atomic<DXGI_FORMAT>, slot_count> slot_formats{};
 // Mip levels of the game's own view of each screen texture (first level, count; UINT(-1) = all from first). The fix
 // samples exactly those: a sim that never fills a texture's smaller mips (iFly 737 CDUs and radios) only views level 0.
-std::array<UINT, slot_count> slot_first_mip{}, slot_mip_count{};
+std::array<std::atomic<UINT>, slot_count> slot_first_mip{}, slot_mip_count{};
 std::mutex view_mips_mutex;
 std::unordered_map<ID3D12Resource*, std::pair<UINT, UINT>> view_mips;
 // Full-size sampling (experimental section, on by default): screen textures are read at full
 // size only, their smaller mip levels flicker as the view moves. Off: the game's own mip levels, as before 0.8.4.
 std::atomic<bool> mip0_only{true};
 std::array<std::atomic<uint64_t>, slot_count> slot_last_used{};
-std::atomic<uint64_t> present_count{0};
 std::mutex slots_mutex;
 UINT descriptor_size = 0;
 
@@ -622,30 +677,40 @@ void register_heap(uintptr_t start, UINT count) {
     auto heap = std::make_unique<MirrorHeap>();
     heap->start = start; heap->end = start + SIZE_T(count) * descriptor_size;
     heap->ids = std::make_unique<std::atomic<uint32_t>[]>(count); // value-initialised: all 0
-    std::lock_guard lock(heaps_mutex);
-    auto snapshot = std::make_unique<HeapSnapshot>();
-    if (const auto current = heap_snapshot.load()) // a heap at the same addresses replaces released ones there
-        for (auto h : current->heaps) if (h->end <= heap->start || h->start >= heap->end) snapshot->heaps.push_back(h);
-    snapshot->heaps.push_back(heap.get());
-    std::sort(snapshot->heaps.begin(), snapshot->heaps.end(), [](const MirrorHeap* a, const MirrorHeap* b) { return a->start < b->start; });
-    heap_storage.push_back(std::move(heap));
-    heap_snapshot.store(snapshot.get(), std::memory_order_release);
-    snapshot_storage.push_back(std::move(snapshot));
-    const size_t heaps = heap_storage.size();
+    size_t heaps = 0;
+    {
+        std::lock_guard lock(heaps_mutex);
+        auto snapshot = std::make_unique<HeapSnapshot>();
+        if (const auto current = heap_snapshot.load()) // a heap at the same addresses replaces released ones there
+            for (auto h : current->heaps) if (h->end <= heap->start || h->start >= heap->end) snapshot->heaps.push_back(h);
+        snapshot->heaps.push_back(heap.get());
+        std::sort(snapshot->heaps.begin(), snapshot->heaps.end(), [](const MirrorHeap* a, const MirrorHeap* b) { return a->start < b->start; });
+        heap_storage.push_back(std::move(heap));
+        heap_snapshot.store(snapshot.get(), std::memory_order_release);
+        snapshot_storage.push_back(std::move(snapshot));
+        heaps = heap_storage.size();
+    }
     if ((heaps & (heaps - 1)) == 0) log("descriptor tracking: %llu heaps mirrored (latest %u descriptors)", uint64_t(heaps), count);
 }
 uint32_t texture_id(ID3D12Resource* resource, DXGI_FORMAT format) {
-    std::lock_guard lock(texture_ids_mutex);
-    if (const auto found = texture_id_of.find({resource, format}); found != texture_id_of.end()) return found->second;
-    const uint32_t id = texture_id_count.load();
-    if (id >= max_texture_ids) {
+    uint32_t id = 0;
+    bool full = false;
+    {
+        std::lock_guard lock(texture_ids_mutex);
+        if (const auto found = texture_id_of.find({resource, format}); found != texture_id_of.end()) return found->second;
+        id = texture_id_count.load();
+        if (id >= max_texture_ids) full = true;
+        else {
+            texture_ids[id].format = format;
+            texture_ids[id].resource = resource;
+            texture_id_count.store(id + 1, std::memory_order_release);
+            texture_id_of[{resource, format}] = id;
+        }
+    }
+    if (full) {
         LOG_ONCE("descriptor tracking: texture table full, new screen textures are not tracked");
         return 0;
     }
-    texture_ids[id].format = format;
-    texture_ids[id].resource = resource;
-    texture_id_count = id + 1;
-    texture_id_of[{resource, format}] = id;
     return id;
 }
 void forget_texture_ids(ID3D12Resource* resource) {
@@ -722,7 +787,8 @@ using CreateHeap = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_DESCRI
 CreateHeap original_create_heap = nullptr;
 HRESULT STDMETHODCALLTYPE create_heap_hook(ID3D12Device* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc, REFIID riid, void** heap) {
     const HRESULT hr = original_create_heap(device, desc, riid, heap);
-    if (SUCCEEDED(hr) && !shutting_down.load(std::memory_order_relaxed) && heap && *heap && desc && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && device == main_device) {
+    if (SUCCEEDED(hr) && !passthrough() && heap && *heap && desc && desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && device == main_device) {
+        record_resource_churn(2);
         ComPtr<ID3D12DescriptorHeap> created;
         if (SUCCEEDED(static_cast<IUnknown*>(*heap)->QueryInterface(IID_PPV_ARGS(&created)))) {
             if (track_descriptors.load(std::memory_order_relaxed)) register_heap(created->GetCPUDescriptorHandleForHeapStart().ptr, desc->NumDescriptors);
@@ -805,27 +871,33 @@ DXGI_FORMAT typed(DXGI_FORMAT format) {
 bool typeless(DXGI_FORMAT format) { return typed(format) != format; }
 
 int slot_of(ID3D12Resource* resource, DXGI_FORMAT format) {
+    if (!resource || format == DXGI_FORMAT_UNKNOWN) return -1;
     const auto now = present_count.load(std::memory_order_relaxed);
-    for (unsigned i = 0; i < slot_count; ++i) if (slot_resources[i].load() == resource) { slot_last_used[i] = now; return int(i); }
-    std::lock_guard lock(slots_mutex);
-    // Free slot first, else the least recently used one that has not been drawn for ~3 s (aircraft changes, closed pages).
-    int chosen = -1;
-    for (unsigned i = 0; i < slot_count && chosen < 0; ++i) if (!slot_resources[i].load()) chosen = int(i);
-    if (chosen < 0) {
-        uint64_t oldest = UINT64_MAX;
-        for (unsigned i = 0; i < slot_count; ++i)
-            if (now > slot_last_used[i] + 120 && slot_last_used[i] < oldest) { oldest = slot_last_used[i]; chosen = int(i); }
-    }
-    if (chosen < 0) return -1;
-    slot_formats[chosen] = format;
-    slot_last_used[chosen] = now;
+    for (unsigned i = 0; i < slot_count; ++i) if (slot_resources[i].load(std::memory_order_acquire) == resource) { slot_last_used[i].store(now, std::memory_order_relaxed); return int(i); }
+    const auto d = resource->GetDesc();
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Width < 64 || d.Height < 64 || !d.MipLevels) return -1;
     std::pair<UINT, UINT> mips{0, UINT(-1)};
     bool known = false;
     { std::lock_guard view_lock(view_mips_mutex); if (const auto found = view_mips.find(resource); found != view_mips.end()) { mips = found->second; known = true; } }
-    slot_first_mip[chosen] = mips.first; slot_mip_count[chosen] = mips.second;
-    slot_resources[chosen] = resource;
+    int chosen = -1;
+    {
+        std::lock_guard lock(slots_mutex);
+        for (unsigned i = 0; i < slot_count; ++i) if (slot_resources[i].load(std::memory_order_relaxed) == resource) { slot_last_used[i].store(now, std::memory_order_relaxed); return int(i); }
+        // Free slot first, else the least recently used one that has not been drawn for ~3 s (aircraft changes, closed pages).
+        for (unsigned i = 0; i < slot_count && chosen < 0; ++i) if (!slot_resources[i].load(std::memory_order_relaxed)) chosen = int(i);
+        if (chosen < 0) {
+            uint64_t oldest = UINT64_MAX;
+            for (unsigned i = 0; i < slot_count; ++i)
+                if (now > slot_last_used[i] + 120 && slot_last_used[i] < oldest) { oldest = slot_last_used[i]; chosen = int(i); }
+        }
+        if (chosen < 0) return -1;
+        slot_formats[chosen].store(format, std::memory_order_relaxed);
+        slot_last_used[chosen].store(now, std::memory_order_relaxed);
+        slot_first_mip[chosen].store(mips.first, std::memory_order_relaxed);
+        slot_mip_count[chosen].store(mips.second, std::memory_order_relaxed);
+        slot_resources[chosen].store(resource, std::memory_order_release);
+    }
     bounds_reset.fetch_or(1u << chosen);
-    const auto d = resource->GetDesc();
     log("display_slot slot=%d resource=%p w=%llu h=%u mips=%u format=%u game_view_mips=%u+%d%s", chosen, resource, d.Width, d.Height, d.MipLevels, unsigned(format),
         mips.first, int(mips.second), known ? "" : " (view not seen)");
     return chosen;
@@ -836,7 +908,7 @@ struct Map {
     UINT width = 0, height = 0, layers = 1; // one layer per view (VR: 2 eyes, or 4 views with foveated rendering)
     ComPtr<ID3D12Resource> texture, tiles, residual, glass_history, glass_history_uv; // glass_history(_uv): per render pixel and view
     ComPtr<ID3D12DescriptorHeap> rtv;
-    bool initialised = false;
+    std::atomic<bool> initialised{false};
     std::atomic<uint32_t> views{0}; // layers drawn this frame and not yet composited (upscaler calls come in view order)
     std::atomic<uint64_t> recorded_present{0}; // present count when screens were last recorded into the map
     // Diagnostics (VR): upscaler calls since the last present, to tell each call's view apart without the views count.
@@ -905,6 +977,9 @@ struct __declspec(uuid("9E1F3C77-5A2B-4D8E-B0C4-71D6A2E9F015")) ListState {
     DeviceState* device = nullptr; // null: a list of another device (e.g. the sim's software device), not followed
     DisplayPipeline* display = nullptr;
     uint64_t pso = 0, layout = 0;
+    ID3D12RootSignature* compute_root = nullptr;
+    std::array<ID3D12DescriptorHeap*, 2> heaps{};
+    UINT heap_count = 0;
     std::array<uint64_t, 64> tables{};
     std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 8> targets{};
     D3D12_CPU_DESCRIPTOR_HANDLE depth{};
@@ -916,10 +991,33 @@ struct __declspec(uuid("9E1F3C77-5A2B-4D8E-B0C4-71D6A2E9F015")) ListState {
     bool scissor_known = false;
 };
 
+using CreateSrv = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+using CreateUav = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, ID3D12Resource*, const D3D12_UNORDERED_ACCESS_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+using CreateRtv = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+CreateSrv original_create_srv = nullptr;
+CreateUav original_create_uav = nullptr;
+CreateRtv original_create_rtv = nullptr;
+void create_srv_direct(ID3D12Device* device, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    if (original_create_srv) original_create_srv(device, resource, desc, handle);
+    else device->CreateShaderResourceView(resource, desc, handle);
+}
+void create_uav_direct(ID3D12Device* device, ID3D12Resource* resource, ID3D12Resource* counter, const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    if (original_create_uav) original_create_uav(device, resource, counter, desc, handle);
+    else device->CreateUnorderedAccessView(resource, counter, desc, handle);
+}
+void create_rtv_direct(ID3D12Device* device, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+    if (original_create_rtv) original_create_rtv(device, resource, desc, handle);
+    else device->CreateRenderTargetView(resource, desc, handle);
+}
+
 Map* map_for(DeviceState& device, UINT width, UINT height, UINT layers) {
-    std::lock_guard lock(device.maps_mutex);
-    for (auto& map : device.maps) if (map->width == width && map->height == height && map->layers == layers) return map.get();
-    if (device.maps.size() >= 6 || !width || !height || width > 8192 || height > 8192 || !layers || layers > 8) return nullptr;
+    if (!width || !height || width > 8192 || height > 8192 || !layers || layers > 8) return nullptr;
+    {
+        std::lock_guard lock(device.maps_mutex);
+        for (auto& map : device.maps) if (map->width == width && map->height == height && map->layers == layers) return map.get();
+        if (device.maps.size() >= 6) return nullptr;
+    }
+    Internal internal;
     auto map = std::make_unique<Map>();
     map->width = width; map->height = height; map->layers = layers;
     D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
@@ -939,10 +1037,17 @@ Map* map_for(DeviceState& device, UINT width, UINT height, UINT layers) {
     if (FAILED(device.native->CreateDescriptorHeap(&h, IID_PPV_ARGS(&map->rtv)))) return nullptr;
     D3D12_RENDER_TARGET_VIEW_DESC rtv{glass::map_format, D3D12_RTV_DIMENSION_TEXTURE2DARRAY};
     rtv.Texture2DArray = {0, 0, layers, 0};
-    device.native->CreateRenderTargetView(map->texture.Get(), &rtv, map->rtv->GetCPUDescriptorHandleForHeapStart());
+    create_rtv_direct(device.native, map->texture.Get(), &rtv, map->rtv->GetCPUDescriptorHandleForHeapStart());
+    Map* result = nullptr;
+    {
+        std::lock_guard lock(device.maps_mutex);
+        for (auto& existing : device.maps) if (existing->width == width && existing->height == height && existing->layers == layers) return existing.get();
+        if (device.maps.size() >= 6) return nullptr;
+        device.maps.push_back(std::move(map));
+        result = device.maps.back().get();
+    }
     log("map_created w=%u h=%u layers=%u", width, height, layers);
-    device.maps.push_back(std::move(map));
-    return device.maps.back().get();
+    return result;
 }
 
 constexpr D3D12_RESOURCE_STATES map_resting = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -970,17 +1075,6 @@ void install_ffx();
 void install_d3d12_hooks(ID3D12Device* device);
 void install_dxgi_hooks(IUnknown* factory);
 void install_upscaler_hooks();
-
-// The fix's own D3D12 calls (the map draw, its views, the compute passes, captures) go through the same hooked
-// functions: they pass straight through while this is set on the calling thread.
-thread_local int internal_calls = 0;
-bool passthrough() { return internal_calls || shutting_down.load(std::memory_order_relaxed); }
-struct Internal {
-    Internal() { ++internal_calls; }
-    ~Internal() { --internal_calls; }
-    Internal(const Internal&) = delete;
-    Internal& operator=(const Internal&) = delete;
-};
 
 std::mutex device_mutex;
 bool same_adapter(ID3D12Device* a, ID3D12Device* b) {
@@ -1105,13 +1199,29 @@ void root_signature_created(const void* blob, SIZE_T size, ID3D12RootSignature* 
 // Destruction of screen texture candidates: a small COM object is attached to each and released by the runtime when the
 // texture is destroyed.
 void texture_destroyed(ID3D12Resource* native) {
-    { std::shared_lock lock(textures_mutex); if (!known_textures.contains(native)) return; }
-    std::unique_lock lock(textures_mutex);
-    known_textures.erase(native);
+    { std::unique_lock rtv_lock(rtv_mutex); std::erase_if(rtv_resources, [&](const auto& p) { return p.second == native; }); }
+    bool was_known = false;
+    {
+        std::unique_lock lock(textures_mutex);
+        if (known_textures.erase(native)) {
+            was_known = true;
+            std::erase_if(signatures, [&](const auto& p) { return p.second.resource == native; });
+        }
+    }
+    if (!was_known) return;
     { std::lock_guard view_lock(view_mips_mutex); view_mips.erase(native); }
-    std::erase_if(signatures, [&](const auto& p) { return p.second.resource == native; });
     if (track_descriptors.load(std::memory_order_relaxed)) forget_texture_ids(native);
-    for (auto& slot : slot_resources) { auto expected = native; slot.compare_exchange_strong(expected, nullptr); }
+    {
+        std::lock_guard slot_lock(slots_mutex);
+        for (unsigned i = 0; i < slot_count; ++i) {
+            auto expected = native;
+            if (slot_resources[i].compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel)) {
+                slot_formats[i].store(DXGI_FORMAT_UNKNOWN, std::memory_order_relaxed);
+                slot_first_mip[i].store(0, std::memory_order_relaxed);
+                slot_mip_count[i].store(1, std::memory_order_relaxed);
+            }
+        }
+    }
 }
 struct __declspec(uuid("5C0E6A2D-3B1F-4E8A-9D47-0F2B8C61A3E9")) ReleaseNotifier final : IUnknown {
     ID3D12Resource* resource;
@@ -1149,16 +1259,20 @@ void view_created(ID3D12Resource* native, const D3D12_SHADER_RESOURCE_VIEW_DESC*
     auto state = main_state;
     if (!state || !state->scratch || descriptor_size > 32) return;
     const auto r = native->GetDesc();
+    Signature initial_sig{};
+    bool initial_readable = false;
     if (r.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && handle.ptr) {
-        Signature d{};
-        if (read_bytes(reinterpret_cast<const void*>(handle.ptr), d.bytes.data(), descriptor_size)) {
-            std::lock_guard lock(diag_mutex);
-            if (diag_views.size() >= 262144) diag_views.clear();
-            diag_views[d] = {uint32_t(r.Width), r.Height, uint32_t(r.Format), uint32_t(r.Flags), r.DepthOrArraySize, uint16_t(r.SampleDesc.Count), r.MipLevels};
+        initial_readable = read_bytes(reinterpret_cast<const void*>(handle.ptr), initial_sig.bytes.data(), descriptor_size);
+        if (initial_readable) {
+            std::unique_lock lock(diag_mutex, std::try_to_lock);
+            if (lock.owns_lock()) {
+                if (diag_views.size() >= 262144) diag_views.clear();
+                diag_views[initial_sig] = {uint32_t(r.Width), r.Height, uint32_t(r.Format), uint32_t(r.Flags), r.DepthOrArraySize, uint16_t(r.SampleDesc.Count), r.MipLevels};
+            }
         }
     }
     // Cockpit screens are plain single-sample 2D textures.
-    if (r.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || r.SampleDesc.Count != 1 || r.DepthOrArraySize != 1 || r.Width < 64 || r.Height < 64) return;
+    if (r.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || r.SampleDesc.Count != 1 || r.DepthOrArraySize != 1 || r.Width < 64 || r.Height < 64 || !r.MipLevels) return;
     // Only RGBA8 colour textures the GPU writes (render target or UAV), the kind cockpit screens are. Recreating views
     // of other textures (depth/stencil planes, video, streamed material textures) at sim startup removed the device.
     const bool written = (r.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0;
@@ -1181,37 +1295,54 @@ void view_created(ID3D12Resource* native, const D3D12_SHADER_RESOURCE_VIEW_DESC*
         // The game's mip range for this texture; a second, different view of it is logged (the first one is used).
         const std::pair<UINT, UINT> mips = default_view ? std::pair<UINT, UINT>{0, UINT(-1)}
             : std::pair<UINT, UINT>{srv.Texture2D.MostDetailedMip, srv.Texture2D.MipLevels};
-        std::lock_guard view_lock(view_mips_mutex);
-        const auto [it, added] = view_mips.try_emplace(native, mips);
-        static std::atomic<int> logged{0};
-        if (!added && it->second != mips && logged++ < 16)
-            log("note screen texture %p has views with different mips: %u+%d and %u+%d (the first is used)", native, it->second.first, int(it->second.second), mips.first, int(mips.second));
+        std::pair<UINT, UINT> existing_mips{};
+        bool log_mismatch = false;
+        {
+            std::lock_guard view_lock(view_mips_mutex);
+            const auto [it, added] = view_mips.try_emplace(native, mips);
+            static std::atomic<int> logged{0};
+            if (!added && it->second != mips && logged++ < 16) {
+                existing_mips = it->second;
+                log_mismatch = true;
+            }
+        }
+        if (log_mismatch)
+            log("note screen texture %p has views with different mips: %u+%d and %u+%d (the first is used)", native, existing_mips.first, int(existing_mips.second), mips.first, int(mips.second));
     }
     if (track_descriptors.load(std::memory_order_relaxed) && handle.ptr) set_tracked(uintptr_t(handle.ptr), texture_id(native, format));
-    const auto slot = state->scratch->GetCPUDescriptorHandleForHeapStart();
     Signature s{};
     bool readable = false;
-    {
-        // One scratch descriptor: its own lock, so that the texture tables' lock (also taken when a texture is destroyed,
-        // inside the runtime) is never held across a D3D12 call.
+    if ((default_view || view->ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) && initial_readable) {
+        // Reuse the descriptor bytes just written into handle.ptr by original_create_srv without re-entering the D3D12
+        // vtable hook chain (avoids deadlocks with other ReShade add-ons such as renodx-dlss.addon64).
+        s = initial_sig;
+        readable = true;
+    } else {
+        // 2D-array SRV converted to a 2D SRV: write into the scratch descriptor via original_create_srv directly.
+        const auto slot = state->scratch->GetCPUDescriptorHandleForHeapStart();
         static std::mutex scratch_mutex;
         std::lock_guard scratch_lock(scratch_mutex);
         Internal internal;
-        state->native->CreateShaderResourceView(native, default_view ? nullptr : &srv, slot);
+        create_srv_direct(state->native, native, default_view ? nullptr : &srv, slot);
         readable = read_bytes(reinterpret_cast<const void*>(slot.ptr), s.bytes.data(), descriptor_size);
     }
-    bool first_view = false;
+    bool first_view = false, log_candidate = false;
     {
         std::unique_lock lock(textures_mutex);
         if (readable && signatures.size() < 16384) {
             signatures[s] = {native, format};
             static std::atomic<int> logged{0};
-            if (logged++ < 40) log("texture_candidate resource=%p w=%llu h=%u mips=%u format=%u default_view=%d", native, r.Width, r.Height,
-                unsigned(r.MipLevels), unsigned(format), default_view);
+            if (logged++ < 40) log_candidate = true;
         }
         first_view = known_textures.insert(native).second;
     }
-    if (first_view) notify_on_destroy(native);
+    if (log_candidate)
+        log("texture_candidate resource=%p w=%llu h=%u mips=%u format=%u default_view=%d", native, r.Width, r.Height,
+            unsigned(r.MipLevels), unsigned(format), default_view);
+    if (first_view) {
+        record_resource_churn(8);
+        notify_on_destroy(native);
+    }
 } catch (...) {}
 
 // Command lists: the state each one has bound (what ReShade kept per list). Looked up on every hooked call, so first a
@@ -1232,21 +1363,31 @@ ListState* find_list(ID3D12GraphicsCommandList* list) {
     return nullptr;
 }
 ListState* add_list(ID3D12GraphicsCommandList* list) {
-    std::lock_guard lock(list_table_mutex);
-    if (auto state = find_list(list)) return state;
-    if (list_table_count >= list_table_size * 3 / 4) { LOG_ONCE("WARNING command list table full: lists created from now on are not followed"); return nullptr; }
-    auto state = new ListState;
-    state->native = list;
+    if (!list) return nullptr;
     ComPtr<ID3D12Device> device;
-    if (SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&device))) && device.Get() == main_device) state->device = main_state;
-    state->generation = generation;
+    const bool on_main_device = SUCCEEDED(list->GetDevice(IID_PPV_ARGS(&device))) && device.Get() == main_device;
+    ListState* state = nullptr;
+    bool table_full = false;
+    {
+        std::lock_guard lock(list_table_mutex);
+        if (auto existing = find_list(list)) return existing;
+        if (list_table_count >= list_table_size * 3 / 4) table_full = true;
+        else {
+            state = new ListState;
+            state->native = list;
+            if (on_main_device) state->device = main_state;
+            state->generation = generation;
+            size_t i = list_slot(list);
+            while (list_table[i].list.load(std::memory_order_relaxed)) i = (i + 1) & (list_table_size - 1);
+            list_table[i].state.store(state, std::memory_order_release);
+            list_table[i].list.store(list, std::memory_order_release);
+            ++list_table_count;
+        }
+    }
+    if (table_full) { LOG_ONCE("WARNING command list table full: lists created from now on are not followed"); return nullptr; }
     // The upscaler hooks find a list's state through this, also when another mod hands them its own wrapper of the list.
+    Internal internal;
     list->SetPrivateData(__uuidof(ListState), sizeof(state), &state);
-    size_t i = list_slot(list);
-    while (list_table[i].list.load(std::memory_order_relaxed)) i = (i + 1) & (list_table_size - 1);
-    list_table[i].state.store(state, std::memory_order_release);
-    list_table[i].list.store(list, std::memory_order_release);
-    ++list_table_count;
     return state;
 }
 // A list's entry, whichever device it belongs to (null only when the table is full).
@@ -1293,6 +1434,19 @@ void pipeline_bound(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeli
     if (!enabled.load(std::memory_order_relaxed)) return;
     if (auto state = list_state(list)) bind_pipeline(*state, pipeline);
 }
+void heaps_bound(ID3D12GraphicsCommandList* list, UINT count, ID3D12DescriptorHeap* const* heaps) {
+    CpuScope scope(cpu_binds);
+    if (auto state = list_state(list)) {
+        state->heap_count = count <= 2 && heaps ? count : 0;
+        for (UINT i = 0; i < state->heap_count; ++i) state->heaps[i] = heaps[i];
+        for (UINT i = state->heap_count; i < 2; ++i) state->heaps[i] = nullptr;
+        state->tables = {};
+    }
+}
+void compute_root_signature_bound(ID3D12GraphicsCommandList* list, ID3D12RootSignature* root) {
+    CpuScope scope(cpu_binds);
+    if (auto state = list_state(list)) state->compute_root = root;
+}
 void root_signature_bound(ID3D12GraphicsCommandList* list, ID3D12RootSignature* root) {
     CpuScope scope(cpu_binds);
     if (!enabled.load(std::memory_order_relaxed)) return;
@@ -1335,6 +1489,7 @@ void pass_ended(ID3D12GraphicsCommandList* list) {
 extern std::atomic<int> capture_requested; // screen capture (below)
 // Returns true when it issued the game's draw itself (the original call is then skipped).
 bool replay(ListState& state, const glass::Draw& draw) noexcept try {
+    if (!state.device || !state.native || !state.display || !state.display->root) return false;
     Internal internal; // the draws below go through the hooked functions
     auto& device = *state.device;
     if (state.in_pass || !state.target_count || !state.depth.ptr || !draw.count || !draw.instances) { note(stats.unsupported_draw, "render_pass_or_targets"); return false; }
@@ -1370,16 +1525,22 @@ bool replay(ListState& state, const glass::Draw& draw) noexcept try {
         bool first;
         { std::lock_guard lock(logged_mutex); first = logged.size() < 24 && logged.insert(s).second; }
         if (first) {
-            size_t tracked_count;
-            tracked_count = texture_id_count.load() - 1;
+            size_t tracked_count = texture_id_count.load() - 1;
+            size_t sig_count = 0;
+            { std::shared_lock lock(textures_mutex); sig_count = signatures.size(); }
             ViewInfo info{};
             bool described = false;
-            { std::lock_guard lock(diag_mutex); if (const auto d = diag_views.find(s); d != diag_views.end()) { info = d->second; described = true; } }
+            { std::unique_lock lock(diag_mutex, std::try_to_lock); if (lock.owns_lock()) if (const auto d = diag_views.find(s); d != diag_views.end()) { info = d->second; described = true; } }
             log("unrecognised_descriptor address=%p bytes=%s known=%llu tracked=%llu texture=%s w=%u h=%u format=%u flags=0x%x layers=%u samples=%u mips=%u",
-                reinterpret_cast<void*>(address), hex(s).c_str(), uint64_t(signatures.size()), uint64_t(tracked_count), described ? "described" : "unknown",
+                reinterpret_cast<void*>(address), hex(s).c_str(), uint64_t(sig_count), uint64_t(tracked_count), described ? "described" : "unknown",
                 info.width, info.height, info.format, info.usage, info.layers, info.samples, info.levels);
         }
         note(stats.unknown_texture, "texture_not_recognised"); return false;
+    }
+    if (!texture.resource || texture.format == DXGI_FORMAT_UNKNOWN) { note(stats.unknown_texture, "texture_null"); return false; }
+    const auto tex_desc = texture.resource->GetDesc();
+    if (tex_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || tex_desc.Width < 64 || tex_desc.Height < 64 || tex_desc.Width > 16384 || tex_desc.Height > 16384 || !tex_desc.MipLevels) {
+        note(stats.unsupported_draw, "texture_dimensions_invalid"); return false;
     }
     const int slot = slot_of(texture.resource, texture.format);
     if (slot < 0) { note(stats.unsupported_draw, "slots_full"); return false; }
@@ -1388,8 +1549,12 @@ bool replay(ListState& state, const glass::Draw& draw) noexcept try {
         // 737's CDU and radios: are they separate draws?).
         static std::mutex draws_mutex;
         static std::set<std::tuple<ID3D12Resource*, uint32_t, uint32_t, int32_t, uint32_t>> draws;
-        std::lock_guard lock(draws_mutex);
-        if (draws.size() < 400 && draws.emplace(texture.resource, draw.count, draw.first, draw.base_vertex, draw.instances).second)
+        bool log_draw = false;
+        {
+            std::lock_guard lock(draws_mutex);
+            log_draw = draws.size() < 400 && draws.emplace(texture.resource, draw.count, draw.first, draw.base_vertex, draw.instances).second;
+        }
+        if (log_draw)
             log("screen_draw slot=%d texture=%p %s count=%u first=%u base_vertex=%d instances=%u", slot, texture.resource, draw.indexed ? "indexed" : "plain",
                 draw.count, draw.first, draw.base_vertex, draw.instances);
     }
@@ -1398,20 +1563,31 @@ bool replay(ListState& state, const glass::Draw& draw) noexcept try {
     const auto target = rtv_resource(state.targets[0]);
     if (!target) { note(stats.unsupported_draw, "target_unknown"); return false; }
     const auto desc = target->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width < 64 || desc.Height < 64 || desc.Width > 8192 || desc.Height > 8192 || desc.SampleDesc.Count != 1) {
+        note(stats.unsupported_draw, "target_dimensions_invalid"); return false;
+    }
     // VR draws all views at once into a layered target; the map gets the same layers.
     const UINT layers = state.display->vr ? std::clamp<UINT>(desc.DepthOrArraySize, 1, 8) : 1;
     auto map = map_for(device, UINT(desc.Width), desc.Height, layers);
-    if (!map) { note(stats.unsupported_draw, "map_allocation"); return false; }
+    if (!map || !map->texture || !map->rtv) { note(stats.unsupported_draw, "map_allocation"); return false; }
     auto native = state.native;
     const auto rtv = map->rtv->GetCPUDescriptorHandleForHeapStart();
-    {
-        std::lock_guard lock(device.maps_mutex);
-        if (!map->initialised) {
-            constexpr float zero[4]{};
-            native->ClearRenderTargetView(rtv, zero, 0, nullptr);
-            map->initialised = true;
-        } else transition(native, map->texture.Get(), map_resting, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (!map->initialised.exchange(true, std::memory_order_acq_rel)) {
+        constexpr float zero[4]{};
+        native->ClearRenderTargetView(rtv, zero, 0, nullptr);
+    } else {
+        transition(native, map->texture.Get(), map_resting, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
+    struct ReplayRestore {
+        ID3D12GraphicsCommandList* list;
+        ListState& state;
+        ID3D12Resource* map_tex;
+        ~ReplayRestore() {
+            if (state.pso) list->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(state.pso));
+            list->OMSetRenderTargets(state.target_count, state.target_count ? state.targets.data() : nullptr, FALSE, state.depth.ptr ? &state.depth : nullptr);
+            transition(list, map_tex, D3D12_RESOURCE_STATE_RENDER_TARGET, map_resting);
+        }
+    } restore{native, state, map->texture.Get()};
     // The game's draw first (its state is still bound), then the map against the depth it wrote (see clone_pipeline).
     if (draw.indexed) native->DrawIndexedInstanced(draw.count, draw.instances, draw.first, draw.base_vertex, draw.first_instance);
     else native->DrawInstanced(draw.count, draw.instances, draw.first, draw.first_instance);
@@ -1441,7 +1617,7 @@ bool replay(ListState& state, const glass::Draw& draw) noexcept try {
                     if (FAILED(device.native->CreateCommittedResource(&colour_heap, D3D12_HEAP_FLAG_NONE, &colour_desc, D3D12_RESOURCE_STATE_RENDER_TARGET, &clear, IID_PPV_ARGS(&device.draw_colour))) ||
                         (!device.draw_colour_rtv && FAILED(device.native->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&device.draw_colour_rtv))))) device.draw_colour = nullptr;
                     else {
-                        device.native->CreateRenderTargetView(device.draw_colour.Get(), nullptr, device.draw_colour_rtv->GetCPUDescriptorHandleForHeapStart());
+                        create_rtv_direct(device.native, device.draw_colour.Get(), nullptr, device.draw_colour_rtv->GetCPUDescriptorHandleForHeapStart());
                         constexpr float zero[4]{};
                         native->ClearRenderTargetView(device.draw_colour_rtv->GetCPUDescriptorHandleForHeapStart(), zero, 0, nullptr);
                     }
@@ -1456,9 +1632,6 @@ bool replay(ListState& state, const glass::Draw& draw) noexcept try {
             }
         }
     }
-    native->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(state.pso));
-    native->OMSetRenderTargets(state.target_count, state.targets.data(), FALSE, &state.depth);
-    transition(native, map->texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, map_resting);
     map->views = map->layers;
     map->recorded_present = present_count.load(std::memory_order_relaxed);
     if (stats.replays++ == 0) log("milestone first cockpit screen recorded (render target %ux%u)", UINT(desc.Width), desc.Height);
@@ -1774,6 +1947,10 @@ bool draw_recorded(ID3D12GraphicsCommandList* list, const glass::Draw& draw) {
     if (!enabled.load(std::memory_order_relaxed) || duplicate_fix.load(std::memory_order_relaxed)) return false;
     auto state = list_state(list);
     if (!state) return false;
+    if (in_warmup()) {
+        if (state->display) ++stats.display_draws;
+        return false;
+    }
     const auto now = present_count.load(std::memory_order_relaxed);
     if (pixel_probing()) pixel_probe(*state, draw);
     if (!state->display && now < screen_probe_until.load(std::memory_order_relaxed)) screen_probe(*state, draw.count, draw.instances);
@@ -1857,11 +2034,19 @@ void log_brightness(DeviceState& d) {
             const float* a = data + slot * 12;
             const float* b = a + 4;
             const float* q = a + 8;
-            const auto resource = slot_resources[slot].load();
-            if (a[3] == 0 || !resource) continue;
-            const auto desc = resource->GetDesc();
+            if (a[3] == 0) continue;
+            uint64_t width = 0;
+            uint32_t height = 0;
+            {
+                std::lock_guard slot_lock(slots_mutex);
+                const auto resource = slot_resources[slot].load(std::memory_order_relaxed);
+                if (!resource) continue;
+                const auto desc = resource->GetDesc();
+                width = desc.Width;
+                height = desc.Height;
+            }
             log("brightness slot=%u screen=%llux%u gain=%.3f,%.3f,%.3f offset=%.4f,%.4f,%.4f mean=%.4f,%.4f,%.4f quality=%.3f samples=%.0f%s", slot,
-                uint64_t(desc.Width), desc.Height, a[0], a[1], a[2], b[0], b[1], b[2], q[0], q[1], q[2], q[3], b[3],
+                width, height, a[0], a[1], a[2], b[0], b[1], b[2], q[0], q[1], q[2], q[3], b[3],
                 a[3] < 0 ? " skipped (screen doesn't match the sim's picture)" : "");
         }
     }
@@ -2434,10 +2619,17 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     const float jitter_x = u.jitter_x, jitter_y = u.jitter_y;
     ID3D12Resource* colour = u.colour;
     ID3D12Resource* output = u.output;
+    if (!colour || !output || !render_w || !render_h) {
+        note(stats.composite_skipped, "upscaler_inputs_invalid"); return;
+    }
     Map* map = nullptr;
     {
         std::lock_guard lock(d.maps_mutex);
         for (auto& m : d.maps) if (m->width == render_w && m->height == render_h) map = m.get();
+    }
+    if (in_warmup()) {
+        if (map) { map->views = 0; map->repeat_valid = false; }
+        return;
     }
     if (!map) {
         // Normal for views without a cockpit; suspicious if screens were drawn at another size.
@@ -2508,6 +2700,9 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     const bool fresh = pending > 0;
     const UINT layer = map->layers > 1 ? layer_for_call(recovered_call >= 0 ? UINT(recovered_call) : map->layers - pending, map->layers, output) : 0;
     const auto out = output->GetDesc(), in = colour->GetDesc();
+    if (out.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || in.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !out.Width || !out.Height) {
+        note(stats.composite_skipped, "upscaler_output_unsupported"); return;
+    }
     // Any float or UNORM colour output the compute pass can write (DLSS in MSFS: R11G11B10_FLOAT).
     const DXGI_FORMAT out_format = typed(out.Format), in_format = typed(in.Format);
     D3D12_FEATURE_DATA_FORMAT_SUPPORT out_support{out_format};
@@ -2536,7 +2731,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     auto at = [&](UINT i) { auto h = cpu; h.ptr += SIZE_T(i) * descriptor_size; return h; };
     D3D12_SHADER_RESOURCE_VIEW_DESC map_srv{glass::map_format, D3D12_SRV_DIMENSION_TEXTURE2DARRAY, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
     map_srv.Texture2DArray = {0, 1, 0, map->layers, 0, 0};
-    d.native->CreateShaderResourceView(map->texture.Get(), &map_srv, at(0));
+    create_srv_direct(d.native, map->texture.Get(), &map_srv, at(0));
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{glass::map_format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
     srv.Texture2D.MipLevels = 1;
     srv.Format = in_format;
@@ -2544,33 +2739,50 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         // VR: layered textures (one layer per view). The upscaler reads and writes layer 0.
         D3D12_SHADER_RESOURCE_VIEW_DESC first_layer{in_format, D3D12_SRV_DIMENSION_TEXTURE2DARRAY, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
         first_layer.Texture2DArray = {0, 1, 0, 1, 0, 0};
-        d.native->CreateShaderResourceView(colour, &first_layer, at(1));
-    } else d.native->CreateShaderResourceView(colour, &srv, at(1));
-    for (unsigned i = 0; i < slot_count; ++i) {
-        auto resource = slot_resources[i].load();
-        srv.Format = resource ? slot_formats[i] : DXGI_FORMAT_R8G8B8A8_UNORM;
-        // The game's own mip range (the fit pass samples like the sim); full-size sampling reads level 0 in the shader.
-        srv.Texture2D.MostDetailedMip = resource ? slot_first_mip[i] : 0;
-        srv.Texture2D.MipLevels = !resource ? 1 : slot_mip_count[i];
-        d.native->CreateShaderResourceView(resource, &srv, at(2 + i));
-        srv.Texture2D.MostDetailedMip = 0;
+        create_srv_direct(d.native, colour, &first_layer, at(1));
+    } else create_srv_direct(d.native, colour, &srv, at(1));
+    {
+        std::lock_guard slot_lock(slots_mutex);
+        for (unsigned i = 0; i < slot_count; ++i) {
+            auto resource = slot_resources[i].load(std::memory_order_relaxed);
+            DXGI_FORMAT fmt = resource ? slot_formats[i].load(std::memory_order_relaxed) : DXGI_FORMAT_R8G8B8A8_UNORM;
+            UINT first_mip = resource ? slot_first_mip[i].load(std::memory_order_relaxed) : 0;
+            UINT mip_count = resource ? slot_mip_count[i].load(std::memory_order_relaxed) : 1;
+            if (resource) {
+                const auto res_desc = resource->GetDesc();
+                if (res_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || res_desc.Width < 64 || res_desc.Height < 64 ||
+                    fmt == DXGI_FORMAT_UNKNOWN || first_mip >= res_desc.MipLevels ||
+                    (mip_count != UINT(-1) && (!mip_count || uint64_t(first_mip) + mip_count > res_desc.MipLevels))) {
+                    resource = nullptr;
+                    fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    first_mip = 0;
+                    mip_count = 1;
+                }
+            }
+            srv.Format = fmt;
+            // The game's own mip range (the fit pass samples like the sim); full-size sampling reads level 0 in the shader.
+            srv.Texture2D.MostDetailedMip = first_mip;
+            srv.Texture2D.MipLevels = mip_count;
+            create_srv_direct(d.native, resource, &srv, at(2 + i));
+            srv.Texture2D.MostDetailedMip = 0;
+        }
     }
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{out_format, D3D12_UAV_DIMENSION_TEXTURE2D};
     if (out.DepthOrArraySize > 1) {
         D3D12_UNORDERED_ACCESS_VIEW_DESC first_layer{out_format, D3D12_UAV_DIMENSION_TEXTURE2DARRAY};
         first_layer.Texture2DArray = {0, 0, 1, 0};
-        d.native->CreateUnorderedAccessView(output, nullptr, &first_layer, at(uav_base + 0));
-    } else d.native->CreateUnorderedAccessView(output, nullptr, &uav, at(uav_base + 0));
+        create_uav_direct(d.native, output, nullptr, &first_layer, at(uav_base + 0));
+    } else create_uav_direct(d.native, output, nullptr, &uav, at(uav_base + 0));
     uav.Format = DXGI_FORMAT_R32_UINT;
-    d.native->CreateUnorderedAccessView(map->tiles.Get(), nullptr, &uav, at(uav_base + 1));
+    create_uav_direct(d.native, map->tiles.Get(), nullptr, &uav, at(uav_base + 1));
     D3D12_UNORDERED_ACCESS_VIEW_DESC structured{DXGI_FORMAT_UNKNOWN, D3D12_UAV_DIMENSION_BUFFER};
     structured.Buffer = {0, slot_count * 3, 16, 0, D3D12_BUFFER_UAV_FLAG_NONE};
-    d.native->CreateUnorderedAccessView(d.params.Get(), nullptr, &structured, at(uav_base + 2));
+    create_uav_direct(d.native, d.params.Get(), nullptr, &structured, at(uav_base + 2));
     D3D12_UNORDERED_ACCESS_VIEW_DESC map_uav{glass::map_format, D3D12_UAV_DIMENSION_TEXTURE2DARRAY};
     map_uav.Texture2DArray = {0, 0, map->layers, 0};
-    d.native->CreateUnorderedAccessView(map->texture.Get(), nullptr, &map_uav, at(uav_base + 3));
+    create_uav_direct(d.native, map->texture.Get(), nullptr, &map_uav, at(uav_base + 3));
     uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    d.native->CreateUnorderedAccessView(map->residual.Get(), nullptr, &uav, at(uav_base + 4));
+    create_uav_direct(d.native, map->residual.Get(), nullptr, &uav, at(uav_base + 4));
     // Temporal anti-aliasing history: made when first used, again when the output size changes.
     bool temporal = temporal_aa.load(std::memory_order_relaxed) != 0 && layer < 8;
     if (temporal && (!map->history || map->history_w != out_w || map->history_h != out_h)) {
@@ -2602,17 +2814,17 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     } else map->history_present.fill(0);
     D3D12_UNORDERED_ACCESS_VIEW_DESC history_view{DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2DARRAY};
     history_view.Texture2DArray = {0, 0, map->layers * 2, 0};
-    d.native->CreateUnorderedAccessView(temporal ? map->history.Get() : nullptr, nullptr, &history_view, at(uav_base + 5));
+    create_uav_direct(d.native, temporal ? map->history.Get() : nullptr, nullptr, &history_view, at(uav_base + 5));
     history_view.Format = DXGI_FORMAT_R16G16_UNORM;
-    d.native->CreateUnorderedAccessView(temporal ? map->history_uv.Get() : nullptr, nullptr, &history_view, at(uav_base + 6));
+    create_uav_direct(d.native, temporal ? map->history_uv.Get() : nullptr, nullptr, &history_view, at(uav_base + 6));
     D3D12_UNORDERED_ACCESS_VIEW_DESC raw{DXGI_FORMAT_R32_TYPELESS, D3D12_UAV_DIMENSION_BUFFER};
     raw.Buffer = {0, 2 * slot_count * bounds_cells * bounds_cells * 4 + 64 + 128, 0, 0, D3D12_BUFFER_UAV_FLAG_RAW};
-    d.native->CreateUnorderedAccessView(d.edge_bounds.Get(), nullptr, &raw, at(uav_base + 7));
+    create_uav_direct(d.native, d.edge_bounds.Get(), nullptr, &raw, at(uav_base + 7));
     D3D12_UNORDERED_ACCESS_VIEW_DESC glass_view{DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2DARRAY};
     glass_view.Texture2DArray = {0, 0, map->layers, 0};
-    d.native->CreateUnorderedAccessView(map->glass_history.Get(), nullptr, &glass_view, at(uav_base + 8));
+    create_uav_direct(d.native, map->glass_history.Get(), nullptr, &glass_view, at(uav_base + 8));
     glass_view.Format = DXGI_FORMAT_R16G16_UNORM;
-    d.native->CreateUnorderedAccessView(map->glass_history_uv.Get(), nullptr, &glass_view, at(uav_base + 9));
+    create_uav_direct(d.native, map->glass_history_uv.Get(), nullptr, &glass_view, at(uav_base + 9));
     // The upscaler's depth input for the occlusion check (a null view when the check is off or the input unusable: not at
     // render size, multisampled, an array, or a depth direction the display shader doesn't tell). In VR the sim calls the
     // upscaler once per eye with that eye's depth, which matches the map layer of this call.
@@ -2630,7 +2842,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         if (logged[map->layers > 1]++ < 4) log("occlusion_check %s depth input %p %llux%u format=%u layers=%u samples=%u state=0x%x usable=%d direction=%d vr=%d", u.name, u.depth,
             z.Width, z.Height, unsigned(z.Format), unsigned(z.DepthOrArraySize), z.SampleDesc.Count, unsigned(u.depth_state), usable, direction, int(map->layers > 1));
     }
-    d.native->CreateShaderResourceView(depth, &depth_view, at(uav_base + 10));
+    create_srv_direct(d.native, depth, &depth_view, at(uav_base + 10));
 
     struct { UINT map_w, map_h, out_w, out_h; float scale_x, scale_y, jitter_x, jitter_y, smoothing; UINT flags; float line_width; UINT layer; float glass; float edge_fade, edge_stretch, detail_clamp, angle_soften;
         UINT history_info, frame_index, bounds_reset, diag_index; float edge_trim; } constants{
@@ -2642,19 +2854,41 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     d.diag_calls[d.diag_index & 63] = {present_count.load(std::memory_order_relaxed), map->recorded_present.load(), pending, map->views.load(), output, GetCurrentThreadId()};
 
     auto native = state->native;
+    // DLSS leaves its colour input compute-readable and the output as UAV; FSR reports the states it restores.
+    const bool colour_moved = !(u.colour_state & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const bool output_moved = u.output_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    const bool depth_moved = depth && !(u.depth_state & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (colour_moved) transition(native, colour, u.colour_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (output_moved) transition(native, output, u.output_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (depth_moved) transition(native, depth, u.depth_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    // Strictly restore resource states, descriptor heaps, compute root signature and pipeline state when returning so
+    // other ReShade add-ons in the hook chain (e.g. renodx-dlss.addon64) never encounter modified command list state.
+    struct CompositeRestore {
+        ID3D12GraphicsCommandList* list;
+        ListState& state;
+        ID3D12Resource *colour, *output, *depth;
+        D3D12_RESOURCE_STATES colour_state, output_state, depth_state;
+        bool colour_moved, output_moved, depth_moved;
+        ~CompositeRestore() {
+            if (colour_moved) transition(list, colour, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, colour_state);
+            if (output_moved) transition(list, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, output_state);
+            if (depth_moved) transition(list, depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, depth_state);
+            ID3D12DescriptorHeap* valid_heaps[2]{};
+            UINT valid_count = 0;
+            for (UINT i = 0; i < state.heap_count && i < 2; ++i)
+                if (state.heaps[i]) valid_heaps[valid_count++] = state.heaps[i];
+            if (valid_count) list->SetDescriptorHeaps(valid_count, valid_heaps);
+            if (state.compute_root) list->SetComputeRootSignature(state.compute_root);
+            if (state.pso) list->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(state.pso));
+        }
+    } restore{native, *state, colour, output, depth, u.colour_state, u.output_state, u.depth_state, colour_moved, output_moved, depth_moved};
+
     ID3D12DescriptorHeap* heaps[]{d.heap.Get()};
     native->SetDescriptorHeaps(1, heaps);
     native->SetComputeRootSignature(d.root.Get());
     native->SetComputeRoot32BitConstants(0, 22, &constants, 0);
     native->SetComputeRootDescriptorTable(1, gpu);
     native->SetComputeRootUnorderedAccessView(2, d.sums->GetGPUVirtualAddress());
-    // DLSS leaves its colour input compute-readable and the output as UAV; FSR reports the states it restores.
-    const bool colour_moved = !(u.colour_state & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    const bool output_moved = u.output_state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    if (colour_moved) transition(native, colour, u.colour_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    if (output_moved) transition(native, output, u.output_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    const bool depth_moved = depth && !(u.depth_state & D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    if (depth_moved) transition(native, depth, u.depth_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     uav_barrier(native); // the upscaler just wrote the output
     // Screen capture: the sim's raw frame, the upscaler's output and the screen map, before the fix.
     CaptureFrame capture;
@@ -2685,7 +2919,7 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
     }
     {
         D3D12_UNORDERED_ACCESS_VIEW_DESC fit_view{DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D};
-        d.native->CreateUnorderedAccessView(capturing ? map->fit_input.Get() : nullptr, nullptr, &fit_view, at(uav_base + 11));
+        create_uav_direct(d.native, capturing ? map->fit_input.Get() : nullptr, nullptr, &fit_view, at(uav_base + 11));
     }
     const UINT timed = measuring.load(std::memory_order_relaxed) && d.timestamps && d.timed_calls < max_timed_calls ? ++d.timed_calls : 0;
     if (timed) native->EndQuery(d.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, (timed - 1) * 2);
@@ -2820,10 +3054,6 @@ void composite(ID3D12GraphicsCommandList* supplied, const Upscale& u) noexcept t
         capture_frames.push_back(std::move(capture));
         if (capture_requested.fetch_sub(1) == 1) capture_ready_at = present_count.load() + 10;
     }
-    if (colour_moved) transition(native, colour, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, u.colour_state);
-    if (output_moved) transition(native, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, u.output_state);
-    if (depth_moved) transition(native, depth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, u.depth_state);
-    // Callers of NGX evaluate and ffxDispatch restore their own heaps, root signature and pipeline afterwards.
     last_render_w = render_w; last_render_h = render_h; last_out_w = out_w; last_out_h = out_h;
     last_composite_present = present_count.load(std::memory_order_relaxed);
     last_upscaler = u.name;
@@ -3169,6 +3399,8 @@ void load_settings() {
     mip0_only = GetPrivateProfileIntW(L"experimental", L"full_size_sampling", 1, settings_path().c_str()) != 0;
     calm_glass = GetPrivateProfileIntW(L"experimental", L"calm_glass", 0, settings_path().c_str()) != 0;
     occlusion_check = GetPrivateProfileIntW(L"experimental", L"occlusion_check", 1, settings_path().c_str()) != 0;
+    const int adv_warmup = int(GetPrivateProfileIntW(L"advanced", L"load_warmup_delay_frames", default_load_warmup_delay_frames, settings_path().c_str()));
+    load_warmup_delay_frames = std::clamp(int(GetPrivateProfileIntW(L"experimental", L"load_warmup_delay_frames", adv_warmup, settings_path().c_str())), 0, max_load_warmup_delay_frames);
     {
         wchar_t key[64]{};
         GetPrivateProfileStringW(L"hotkeys", L"settings_window", L"", key, 64, settings_path().c_str());
@@ -3200,16 +3432,17 @@ void save_settings() {
     WritePrivateProfileStringW(L"experimental", L"full_size_sampling", mip0_only.load() ? L"1" : L"0", settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"calm_glass", std::to_wstring(calm_glass.load()).c_str(), settings_path().c_str());
     WritePrivateProfileStringW(L"experimental", L"occlusion_check", std::to_wstring(occlusion_check.load()).c_str(), settings_path().c_str());
+    WritePrivateProfileStringW(L"experimental", L"load_warmup_delay_frames", std::to_wstring(load_warmup_delay_frames.load()).c_str(), settings_path().c_str());
     const auto key = glass::hotkey_name(settings_window_key);
     WritePrivateProfileStringW(L"hotkeys", L"settings_window", std::wstring(key.begin(), key.end()).c_str(), settings_path().c_str());
 }
 // The settings in effect, for the log (at start and when the file is re-read).
 std::string settings_text() {
     char text[768];
-    snprintf(text, sizeof(text), "enabled=%d jitter_positive=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d dark_screen_fix=%d seam_fix=%d full_size_sampling=%d stable_edges=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d occlusion_check=%d",
+    snprintf(text, sizeof(text), "enabled=%d jitter_positive=%d line_smoothing=%d extra_smoothing=%d glass_strength=%d detail_clamp=%d edge_fade=%d angle_softening=%d edge_stretch=%d edge_trim=%d dark_screen_fix=%d seam_fix=%d full_size_sampling=%d stable_edges=%d temporal_aa=%d soft_smoothing=%d calm_glass=%d occlusion_check=%d load_warmup_delay_frames=%d",
         enabled.load(), jitter_positive.load(), smoothing_percent.load(), int(extra_smoothing.load()), glass_percent.load(), detail_clamp_percent.load(),
         edge_fade_percent.load(), angle_soften_percent.load(), edge_stretch_percent.load(), edge_trim_percent.load(), dark_screen_fix.load(), seam_fix.load(), int(mip0_only.load()),
-        stable_edges.load(), temporal_aa.load(), soft_smoothing.load(), calm_glass.load(), occlusion_check.load());
+        stable_edges.load(), temporal_aa.load(), soft_smoothing.load(), calm_glass.load(), occlusion_check.load(), load_warmup_delay_frames.load());
     return text;
 }
 
@@ -3322,6 +3555,30 @@ std::atomic<uint64_t> last_present_tick{0};
 void frame_tick(IDXGISwapChain* swapchain, ID3D12CommandQueue* queue) {
     std::lock_guard lock(frame_mutex);
     const auto now = ++present_count;
+    const uint64_t tick = GetTickCount64();
+    const uint64_t prev_tick = last_frame_tick.exchange(tick, std::memory_order_relaxed);
+    const uint32_t churn = resource_churn_count.exchange(0, std::memory_order_relaxed);
+    if (!fixture_host || fixture_uses_settings) {
+        const int delay = load_warmup_delay_frames.load(std::memory_order_relaxed);
+        if (delay > 0) {
+            const bool frame_spike = prev_tick != 0 && (tick - prev_tick) > 250 && now > 2;
+            const bool churn_spike = churn >= churn_spike_threshold;
+            if (churn_spike || frame_spike) {
+                const uint64_t target = now + uint64_t(delay);
+                uint64_t current = warmup_until_present.load(std::memory_order_relaxed);
+                while (target > current && !warmup_until_present.compare_exchange_weak(current, target, std::memory_order_relaxed));
+                if (!warmup_active.exchange(true, std::memory_order_relaxed))
+                    log("warmup grace period active (%d frames, churn=%u, frame_ms=%llu)", delay, churn, prev_tick ? (unsigned long long)(tick - prev_tick) : 0ULL);
+            } else if (warmup_active.load(std::memory_order_relaxed) && now >= warmup_until_present.load(std::memory_order_relaxed)) {
+                warmup_active.store(false, std::memory_order_relaxed);
+                ++generation;
+                log("warmup grace period finished at frame %llu: overlay active", (unsigned long long)now);
+            }
+        } else {
+            warmup_until_present.store(0, std::memory_order_relaxed);
+            warmup_active.store(false, std::memory_order_relaxed);
+        }
+    }
     if (swapchain) capture_present(swapchain, queue);
     else capture_presents_left = 0; // no presents to capture: the capture finishes with the upscaler frames alone
     capture_flush(now);
@@ -3374,6 +3631,7 @@ void swapchain_created(IUnknown* device, IUnknown* created) noexcept try {
     if (desc.OutputWindow) main_window = desc.OutputWindow, main_area = area;
     main_swapchain = swapchain.Get();
     main_queue = own_queue ? queue : nullptr;
+    record_resource_churn(churn_spike_threshold);
     log("swapchain %p %ux%u format=%u buffers=%u", swapchain.Get(), desc.BufferDesc.Width, desc.BufferDesc.Height, unsigned(desc.BufferDesc.Format), desc.BufferCount);
 } catch (...) {}
 void presented(IDXGISwapChain* swapchain) noexcept try {
@@ -3592,7 +3850,6 @@ void write_status_file() {
     std::ofstream(addon_directory / L"glass-cockpit-dlss-fix-status.txt") << text;
 }
 
-bool fixture_host = false; // the offline test host (no swapchain: it ticks the frame clock itself)
 void housekeeping() {
     uint64_t next_settings = 0, next_install = 0, next_check = 0;
     for (;;) {
@@ -3630,16 +3887,10 @@ HRESULT WINAPI create_device_hook(IUnknown* adapter, D3D_FEATURE_LEVEL level, RE
 
 // Device methods.
 using CreateRootSignature = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
-using CreateSrv = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_SHADER_RESOURCE_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
-using CreateUav = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, ID3D12Resource*, const D3D12_UNORDERED_ACCESS_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
-using CreateRtv = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
 using CreateCommandList = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator*, ID3D12PipelineState*, REFIID, void**);
 using CreateCommandList1 = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device4*, UINT, D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_LIST_FLAGS, REFIID, void**);
 using CreateCommandSignature = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMMAND_SIGNATURE_DESC*, ID3D12RootSignature*, REFIID, void**);
 CreateRootSignature original_create_root_signature = nullptr;
-CreateSrv original_create_srv = nullptr;
-CreateUav original_create_uav = nullptr;
-CreateRtv original_create_rtv = nullptr;
 CreateCommandList original_create_command_list = nullptr;
 CreateCommandList1 original_create_command_list1 = nullptr;
 CreateCommandSignature original_create_command_signature = nullptr;
@@ -3663,6 +3914,7 @@ void STDMETHODCALLTYPE create_uav_hook(ID3D12Device* device, ID3D12Resource* res
 void STDMETHODCALLTYPE create_rtv_hook(ID3D12Device* device, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE handle) {
     original_create_rtv(device, resource, desc, handle);
     if (passthrough() || device != main_device) return;
+    record_resource_churn(2);
     std::unique_lock lock(rtv_mutex);
     rtv_resources[handle.ptr] = resource;
 }
@@ -3765,6 +4017,8 @@ using ListDrawIndexed = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UIN
 using ListCopyTextureRegion = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, const D3D12_TEXTURE_COPY_LOCATION*, UINT, UINT, UINT,
     const D3D12_TEXTURE_COPY_LOCATION*, const D3D12_BOX*);
 using ListSetPipelineState = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
+using ListSetDescriptorHeaps = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, ID3D12DescriptorHeap* const*);
+using ListSetComputeRootSignature = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*);
 using ListSetRootSignature = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12RootSignature*);
 using ListSetRootTable = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, D3D12_GPU_DESCRIPTOR_HANDLE);
 using ListSetRenderTargets = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
@@ -3784,6 +4038,8 @@ ListDraw original_draw = nullptr;
 ListDrawIndexed original_draw_indexed = nullptr;
 ListCopyTextureRegion original_copy_texture_region = nullptr;
 ListSetPipelineState original_set_pipeline_state = nullptr;
+ListSetDescriptorHeaps original_set_descriptor_heaps = nullptr;
+ListSetComputeRootSignature original_set_compute_root_signature = nullptr;
 ListSetRootSignature original_set_root_signature = nullptr;
 ListSetRootTable original_set_root_table = nullptr;
 ListSetRenderTargets original_set_render_targets = nullptr;
@@ -3798,7 +4054,7 @@ HRESULT STDMETHODCALLTYPE reset_hook(ID3D12GraphicsCommandList* list, ID3D12Comm
 }
 void STDMETHODCALLTYPE clear_state_hook(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeline) {
     original_clear_state(list, pipeline);
-    if (!passthrough()) pipeline_bound(list, pipeline);
+    if (!passthrough()) list_reset(list, pipeline);
 }
 // A cockpit screen's draw is issued by the fix itself, followed by its map draw (draw_recorded returns true then).
 void STDMETHODCALLTYPE draw_hook(ID3D12GraphicsCommandList* list, UINT count, UINT instances, UINT first, UINT first_instance) {
@@ -3823,6 +4079,14 @@ void STDMETHODCALLTYPE copy_texture_region_hook(ID3D12GraphicsCommandList* list,
 void STDMETHODCALLTYPE set_pipeline_state_hook(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pipeline) {
     original_set_pipeline_state(list, pipeline);
     if (!passthrough()) pipeline_bound(list, pipeline);
+}
+void STDMETHODCALLTYPE set_descriptor_heaps_hook(ID3D12GraphicsCommandList* list, UINT count, ID3D12DescriptorHeap* const* heaps) {
+    original_set_descriptor_heaps(list, count, heaps);
+    if (!passthrough()) heaps_bound(list, count, heaps);
+}
+void STDMETHODCALLTYPE set_compute_root_signature_hook(ID3D12GraphicsCommandList* list, ID3D12RootSignature* root) {
+    original_set_compute_root_signature(list, root);
+    if (!passthrough()) compute_root_signature_bound(list, root);
 }
 void STDMETHODCALLTYPE set_root_signature_hook(ID3D12GraphicsCommandList* list, ID3D12RootSignature* root) {
     original_set_root_signature(list, root);
@@ -3869,6 +4133,8 @@ Variants<ListDraw> draw_variants;
 Variants<ListDrawIndexed> draw_indexed_variants;
 Variants<ListCopyTextureRegion> copy_texture_region_variants;
 Variants<ListSetPipelineState> set_pipeline_state_variants;
+Variants<ListSetDescriptorHeaps> set_descriptor_heaps_variants;
+Variants<ListSetComputeRootSignature> set_compute_root_signature_variants;
 Variants<ListSetRootSignature> set_root_signature_variants;
 Variants<ListSetRootTable> set_root_table_variants;
 Variants<ListSetRenderTargets> set_render_targets_variants;
@@ -3888,7 +4154,7 @@ template <int V> HRESULT STDMETHODCALLTYPE reset_variant(ID3D12GraphicsCommandLi
 }
 template <int V> void STDMETHODCALLTYPE clear_state_variant(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pipeline) {
     { Internal internal; clear_state_variants.original[V](self, pipeline); }
-    if (!passthrough()) pipeline_bound(base_list(self, clear_state_variants.offset[V]), pipeline);
+    if (!passthrough()) list_reset(base_list(self, clear_state_variants.offset[V]), pipeline);
 }
 template <int V> void STDMETHODCALLTYPE draw_variant(ID3D12GraphicsCommandList* self, UINT count, UINT instances, UINT first, UINT first_instance) {
     if (!passthrough() && draw_recorded(base_list(self, draw_variants.offset[V]), {false, count, instances, first, first_instance, 0})) return;
@@ -3912,6 +4178,14 @@ template <int V> void STDMETHODCALLTYPE copy_texture_region_variant(ID3D12Graphi
 template <int V> void STDMETHODCALLTYPE set_pipeline_state_variant(ID3D12GraphicsCommandList* self, ID3D12PipelineState* pipeline) {
     { Internal internal; set_pipeline_state_variants.original[V](self, pipeline); }
     if (!passthrough()) pipeline_bound(base_list(self, set_pipeline_state_variants.offset[V]), pipeline);
+}
+template <int V> void STDMETHODCALLTYPE set_descriptor_heaps_variant(ID3D12GraphicsCommandList* self, UINT count, ID3D12DescriptorHeap* const* heaps) {
+    { Internal internal; set_descriptor_heaps_variants.original[V](self, count, heaps); }
+    if (!passthrough()) heaps_bound(base_list(self, set_descriptor_heaps_variants.offset[V]), count, heaps);
+}
+template <int V> void STDMETHODCALLTYPE set_compute_root_signature_variant(ID3D12GraphicsCommandList* self, ID3D12RootSignature* root) {
+    { Internal internal; set_compute_root_signature_variants.original[V](self, root); }
+    if (!passthrough()) compute_root_signature_bound(base_list(self, set_compute_root_signature_variants.offset[V]), root);
 }
 template <int V> void STDMETHODCALLTYPE set_root_signature_variant(ID3D12GraphicsCommandList* self, ID3D12RootSignature* root) {
     { Internal internal; set_root_signature_variants.original[V](self, root); }
@@ -3987,6 +4261,12 @@ void install_list_variants(ID3D12GraphicsCommandList* list) noexcept try {
             entry(list_copy_texture_region_slot()), offset);
         hook_variant("set_pipeline_state", set_pipeline_state_variants, VARIANT_DETOURS(set_pipeline_state_variant), hooked(list_set_pipeline_state_slot()),
             entry(list_set_pipeline_state_slot()), offset);
+        if (original_set_descriptor_heaps)
+            hook_variant("set_descriptor_heaps", set_descriptor_heaps_variants, VARIANT_DETOURS(set_descriptor_heaps_variant), hooked(list_set_descriptor_heaps_slot()),
+                entry(list_set_descriptor_heaps_slot()), offset);
+        if (original_set_compute_root_signature)
+            hook_variant("set_compute_root_signature", set_compute_root_signature_variants, VARIANT_DETOURS(set_compute_root_signature_variant), hooked(list_set_compute_root_signature_slot()),
+                entry(list_set_compute_root_signature_slot()), offset);
         hook_variant("set_root_signature", set_root_signature_variants, VARIANT_DETOURS(set_root_signature_variant), hooked(list_set_graphics_root_signature_slot()),
             entry(list_set_graphics_root_signature_slot()), offset);
         hook_variant("set_root_table", set_root_table_variants, VARIANT_DETOURS(set_root_table_variant), hooked(list_set_graphics_root_table_slot()),
@@ -4021,6 +4301,8 @@ bool list_functions_hooked(void** vtable) {
         variant_known(draw_variants, vtable, list_draw_slot()) && variant_known(draw_indexed_variants, vtable, list_draw_indexed_slot()) &&
         variant_known(copy_texture_region_variants, vtable, list_copy_texture_region_slot()) &&
         variant_known(set_pipeline_state_variants, vtable, list_set_pipeline_state_slot()) &&
+        (!original_set_descriptor_heaps || variant_known(set_descriptor_heaps_variants, vtable, list_set_descriptor_heaps_slot())) &&
+        (!original_set_compute_root_signature || variant_known(set_compute_root_signature_variants, vtable, list_set_compute_root_signature_slot())) &&
         variant_known(set_root_signature_variants, vtable, list_set_graphics_root_signature_slot()) &&
         variant_known(set_root_table_variants, vtable, list_set_graphics_root_table_slot()) &&
         variant_known(set_render_targets_variants, vtable, list_set_render_targets_slot()) &&
@@ -4114,6 +4396,8 @@ void install_d3d12_hooks(ID3D12Device* device) {
                 hook_slot(list.Get(), list_draw_indexed_slot(), reinterpret_cast<void*>(&draw_indexed_hook), original_draw_indexed) &&
                 hook_slot(list.Get(), list_copy_texture_region_slot(), reinterpret_cast<void*>(&copy_texture_region_hook), original_copy_texture_region) &&
                 hook_slot(list.Get(), list_set_pipeline_state_slot(), reinterpret_cast<void*>(&set_pipeline_state_hook), original_set_pipeline_state) &&
+                hook_slot(list.Get(), list_set_descriptor_heaps_slot(), reinterpret_cast<void*>(&set_descriptor_heaps_hook), original_set_descriptor_heaps) &&
+                hook_slot(list.Get(), list_set_compute_root_signature_slot(), reinterpret_cast<void*>(&set_compute_root_signature_hook), original_set_compute_root_signature) &&
                 hook_slot(list.Get(), list_set_graphics_root_signature_slot(), reinterpret_cast<void*>(&set_root_signature_hook), original_set_root_signature) &&
                 hook_slot(list.Get(), list_set_graphics_root_table_slot(), reinterpret_cast<void*>(&set_root_table_hook), original_set_root_table) &&
                 hook_slot(list.Get(), list_set_render_targets_slot(), reinterpret_cast<void*>(&set_render_targets_hook), original_set_render_targets);
@@ -4294,11 +4578,17 @@ bool start(void* self_module, void* reshade_module) noexcept try {
     }
     // The offline test runs with default settings unless asked to read the .ini (GLASS_FIXTURE_SETTINGS=1).
     wchar_t fixture_settings[8]{};
-    if (!fixture_host || (GetEnvironmentVariableW(L"GLASS_FIXTURE_SETTINGS", fixture_settings, 8) && fixture_settings[0] == L'1')) {
+    fixture_uses_settings = !fixture_host || (GetEnvironmentVariableW(L"GLASS_FIXTURE_SETTINGS", fixture_settings, 8) && fixture_settings[0] == L'1');
+    if (fixture_uses_settings) {
         std::lock_guard lock(settings_mutex);
         load_settings();
         write_settings_file();
         settings_changed(); // remember the file's time: only later changes are reloads
+        const int delay = load_warmup_delay_frames.load(std::memory_order_relaxed);
+        if (delay > 0) {
+            warmup_until_present.store(uint64_t(delay), std::memory_order_relaxed);
+            warmup_active.store(true, std::memory_order_relaxed);
+        }
     }
     init_tick = GetTickCount64();
     OSVERSIONINFOEXW os{sizeof(os)};
@@ -4343,6 +4633,9 @@ void device_created(ID3D12Device* device) {
 void swapchain_created(IUnknown* queue, IUnknown* swapchain) {
     if (active) ::swapchain_created(queue, swapchain);
 }
+void resource_created(unsigned weight) noexcept {
+    if (active && !passthrough()) record_resource_churn(weight);
+}
 void write_log(const char* format, ...) {
     va_list args; va_start(args, format); log_args(format, args); va_end(args);
 }
@@ -4357,6 +4650,7 @@ Status status() {
     s.settings_window_key = settings_window_key;
     s.gpu_known = gpu_known; s.nvidia = gpu_nvidia; s.dlss_loaded = ngx_hooked || ngx_proxy_hooked; s.fsr_loaded = ffx_hooked; s.shader_found = stats.display_pipelines > 0;
     s.enabled = enabled; s.tint = tint; s.experimental = {detail_clamp_percent, edge_fade_percent, angle_soften_percent, edge_stretch_percent, dark_screen_fix, seam_fix, temporal_aa, soft_smoothing, stable_edges, int(mip0_only.load()), calm_glass, edge_trim_percent, occlusion_check}; s.jitter_positive = jitter_positive; s.line_smoothing = smoothing_percent; s.extra_smoothing = extra_smoothing; s.glass_strength = glass_percent;
+    s.load_warmup_delay_frames = load_warmup_delay_frames;
     s.dlss_calls = stats.evaluations; s.dlss_upscales = stats.dlss_upscales; s.fsr_calls = stats.fsr_dispatches; s.upscaler = last_upscaler; s.screen_draws = stats.display_draws; s.recorded = stats.replays;
     s.overlay_frames = stats.composites; s.skipped = stats.composite_skipped;
     const auto now = present_count.load(std::memory_order_relaxed);

@@ -25,6 +25,8 @@ size_t list_draw_slot() { return offsetof(ID3D12GraphicsCommandListVtbl, DrawIns
 size_t list_draw_indexed_slot() { return offsetof(ID3D12GraphicsCommandListVtbl, DrawIndexedInstanced) / sizeof(void*); }
 size_t list_copy_texture_region_slot() { return offsetof(ID3D12GraphicsCommandListVtbl, CopyTextureRegion) / sizeof(void*); }
 size_t list_set_pipeline_state_slot() { return offsetof(ID3D12GraphicsCommandListVtbl, SetPipelineState) / sizeof(void*); }
+size_t list_set_descriptor_heaps_slot() { return offsetof(ID3D12GraphicsCommandListVtbl, SetDescriptorHeaps) / sizeof(void*); }
+size_t list_set_compute_root_signature_slot() { return offsetof(ID3D12GraphicsCommandListVtbl, SetComputeRootSignature) / sizeof(void*); }
 size_t list_set_graphics_root_signature_slot() { return offsetof(ID3D12GraphicsCommandListVtbl, SetGraphicsRootSignature) / sizeof(void*); }
 size_t list_set_graphics_root_table_slot() { return offsetof(ID3D12GraphicsCommandListVtbl, SetGraphicsRootDescriptorTable) / sizeof(void*); }
 size_t list_set_render_targets_slot() { return offsetof(ID3D12GraphicsCommandListVtbl, OMSetRenderTargets) / sizeof(void*); }

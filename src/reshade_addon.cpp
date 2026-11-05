@@ -30,6 +30,12 @@ void on_init_effect_runtime(api::effect_runtime* runtime) {
     if (!runtime->get_hwnd() || !queue || runtime->get_device()->get_api() != api::device_api::d3d12) return;
     glass::swapchain_created(reinterpret_cast<IUnknown*>(queue->get_native()), reinterpret_cast<IUnknown*>(runtime->get_native()));
 }
+void on_init_resource(api::device* device, const api::resource_desc&, const api::subresource_data*, api::resource_usage, api::resource) {
+    if (device && device->get_api() == api::device_api::d3d12) glass::resource_created(1);
+}
+void on_init_pipeline(api::device* device, api::pipeline_layout, uint32_t, const api::pipeline_subobject*, api::pipeline) {
+    if (device && device->get_api() == api::device_api::d3d12) glass::resource_created(4);
+}
 
 bool started = false;
 }
@@ -49,6 +55,8 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
     }
     reshade::register_event<reshade::addon_event::init_device>(on_init_device);
     reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
+    reshade::register_event<reshade::addon_event::init_resource>(on_init_resource);
+    reshade::register_event<reshade::addon_event::init_pipeline>(on_init_pipeline);
     glass::write_log("overlay tab %s", glass::init_status_panel(reshade_module) ? "added to the ReShade overlay"
         : "unavailable (this ReShade build has a different ImGui version); the fix itself still works");
     return true;
@@ -56,6 +64,8 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon, HMODULE reshade_m
 extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon, HMODULE) {
     glass::write_log("add-on unloaded by ReShade");
     glass::uninit_status_panel();
+    reshade::unregister_event<reshade::addon_event::init_pipeline>(on_init_pipeline);
+    reshade::unregister_event<reshade::addon_event::init_resource>(on_init_resource);
     reshade::unregister_event<reshade::addon_event::init_device>(on_init_device);
     reshade::unregister_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
     reshade::unregister_addon(addon);

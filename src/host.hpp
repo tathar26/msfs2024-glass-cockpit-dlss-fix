@@ -31,4 +31,5 @@ void dxgi_factory_created(IUnknown* factory);
 // the sim presents with and its command queue (native objects, not ReShade's wrappers).
 void device_created(ID3D12Device* device);
 void swapchain_created(IUnknown* queue, IUnknown* swapchain);
+void resource_created(unsigned weight = 1) noexcept;
 }

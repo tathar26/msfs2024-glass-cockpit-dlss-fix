@@ -25,7 +25,7 @@ struct Status {
     bool gpu_known = false, nvidia = false, dlss_loaded = false, fsr_loaded = false, shader_found = false;
     bool enabled = false, tint = false, jitter_positive = false, active = false, extra_smoothing = false;
     Experimental experimental;
-    int line_smoothing = 0, glass_strength = 100;
+    int line_smoothing = 0, glass_strength = 100, load_warmup_delay_frames = 240;
     uint32_t settings_window_key = 0; // standalone: the settings window's hotkey (hotkey_name)
     uint64_t dlss_calls = 0, dlss_upscales = 0, fsr_calls = 0, screen_draws = 0, recorded = 0, overlay_frames = 0, skipped = 0;
     unsigned screens = 0, render_w = 0, render_h = 0, out_w = 0, out_h = 0;
